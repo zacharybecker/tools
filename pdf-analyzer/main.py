@@ -2,14 +2,13 @@ import os
 import base64
 import asyncio
 import logging
-from typing import Optional
 from contextlib import asynccontextmanager
 
 import fitz
 import httpx
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, validator
-from tenacity import retry, stop_after_attempt, wait_exponential
+from pydantic import BaseModel, validator
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,6 +17,12 @@ LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL")
 LITELLM_MODEL = os.getenv("LITELLM_MODEL")
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "5"))
 MAX_PDF_SIZE_MB = int(os.getenv("MAX_PDF_SIZE_MB", "50"))
+
+
+def should_retry(exception):
+    if isinstance(exception, httpx.HTTPStatusError):
+        return exception.response.status_code in [429, 500, 502, 503, 504]
+    return isinstance(exception, (httpx.TimeoutException, httpx.ConnectError))
 
 
 class ConvertRequest(BaseModel):
@@ -50,7 +55,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(min=2, max=60))
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=2, min=4, max=120),
+    retry=retry_if_exception(should_retry)
+)
 async def call_litellm(client, semaphore, image_bytes, page_num):
     async with semaphore:
         image_base64 = base64.b64encode(image_bytes).decode()
@@ -68,6 +77,14 @@ async def call_litellm(client, semaphore, image_bytes, page_num):
                 "max_tokens": 4096
             }
         )
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                wait_time = int(retry_after)
+                logger.warning(f"Rate limited on page {page_num + 1}, waiting {wait_time}s")
+                await asyncio.sleep(wait_time)
+
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
 
