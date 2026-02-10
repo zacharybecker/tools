@@ -17,8 +17,9 @@ LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL")
 LITELLM_MODEL = os.getenv("LITELLM_MODEL")
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "5"))
 MAX_PDF_SIZE_MB = int(os.getenv("MAX_PDF_SIZE_MB", "50"))
-DEFAULT_DPI = int(os.getenv("DEFAULT_DPI", "300"))
+DPI = 300
 MAX_DIMENSION_PX = int(os.getenv("MAX_DIMENSION_PX", "3000"))
+OVERLAP_PX = 100
 
 
 def should_retry(exception):
@@ -62,7 +63,7 @@ app = FastAPI(lifespan=lifespan)
     wait=wait_exponential(multiplier=2, min=4, max=120),
     retry=retry_if_exception(should_retry)
 )
-async def call_litellm(client, semaphore, image_bytes, page_num):
+async def call_litellm(client, semaphore, image_bytes, label):
     async with semaphore:
         image_base64 = base64.b64encode(image_bytes).decode()
         response = await client.post(
@@ -72,7 +73,7 @@ async def call_litellm(client, semaphore, image_bytes, page_num):
                 "messages": [{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Convert this PDF page to markdown. Preserve structure and formatting."},
+                        {"type": "text", "text": "Convert this PDF page section to markdown. Preserve structure and formatting."},
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
                     ]
                 }],
@@ -82,20 +83,21 @@ async def call_litellm(client, semaphore, image_bytes, page_num):
 
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", "30"))
-            logger.warning(f"Rate limited on page {page_num + 1}, waiting {retry_after}s before retry")
+            logger.warning(f"Rate limited on {label}, waiting {retry_after}s before retry")
             await asyncio.sleep(retry_after)
 
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
 
 
-async def convert_page(client, semaphore, image_bytes, page_num):
+async def convert_chunk(client, semaphore, image_bytes, page_num, chunk_num, total_chunks):
     try:
-        markdown = await call_litellm(client, semaphore, image_bytes, page_num)
-        return {"success": True, "page": page_num, "markdown": markdown}
+        label = f"page {page_num + 1}" if total_chunks == 1 else f"page {page_num + 1} chunk {chunk_num + 1}/{total_chunks}"
+        markdown = await call_litellm(client, semaphore, image_bytes, label)
+        return {"success": True, "page": page_num, "chunk": chunk_num, "markdown": markdown}
     except Exception as e:
-        logger.error(f"Page {page_num + 1} failed: {e}")
-        return {"success": False, "page": page_num, "error": str(e)}
+        logger.error(f"Page {page_num + 1} chunk {chunk_num + 1} failed: {e}")
+        return {"success": False, "page": page_num, "chunk": chunk_num, "error": str(e)}
 
 
 @app.post("/convert", response_model=ConvertResponse)
@@ -106,40 +108,59 @@ async def convert_pdf(request: ConvertRequest):
         raise HTTPException(400, f"PDF exceeds {MAX_PDF_SIZE_MB}MB")
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    images = []
-    for page in doc:
-        width_pt = page.rect.width
-        height_pt = page.rect.height
+    zoom = DPI / 72
+    matrix = fitz.Matrix(zoom, zoom)
 
-        width_px = width_pt * DEFAULT_DPI / 72
-        height_px = height_pt * DEFAULT_DPI / 72
-        max_current = max(width_px, height_px)
+    chunks = []
+    for page_num, page in enumerate(doc):
+        width_px = page.rect.width * zoom
+        height_px = page.rect.height * zoom
 
-        if max_current > MAX_DIMENSION_PX:
-            scale = MAX_DIMENSION_PX / max_current
-            dpi = DEFAULT_DPI * scale
+        if height_px <= MAX_DIMENSION_PX and width_px <= MAX_DIMENSION_PX:
+            pix = page.get_pixmap(matrix=matrix)
+            chunks.append({"image": pix.tobytes("png"), "page": page_num, "chunk": 0, "total_chunks": 1})
         else:
-            dpi = DEFAULT_DPI
+            num_chunks = int((max(height_px, width_px) / MAX_DIMENSION_PX)) + 1
+            chunk_height_pt = page.rect.height / num_chunks
+            overlap_pt = OVERLAP_PX / zoom
 
-        zoom = dpi / 72
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-        images.append(pix.tobytes("png"))
+            for chunk_idx in range(num_chunks):
+                y0 = max(0, chunk_idx * chunk_height_pt - overlap_pt)
+                y1 = min(page.rect.height, (chunk_idx + 1) * chunk_height_pt + overlap_pt)
+                clip = fitz.Rect(0, y0, page.rect.width, y1)
+                pix = page.get_pixmap(matrix=matrix, clip=clip)
+                chunks.append({"image": pix.tobytes("png"), "page": page_num, "chunk": chunk_idx, "total_chunks": num_chunks})
+
     doc.close()
 
-    tasks = [convert_page(app.state.client, app.state.semaphore, img, i) for i, img in enumerate(images)]
+    tasks = [convert_chunk(app.state.client, app.state.semaphore, c["image"], c["page"], c["chunk"], c["total_chunks"])
+             for c in chunks]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    successful = [r for r in results if isinstance(r, dict) and r.get("success")]
-    failed = [r for r in results if isinstance(r, dict) and not r.get("success")]
+    page_markdowns = {}
+    for r in results:
+        if isinstance(r, dict) and r.get("success"):
+            page_num = r["page"]
+            if page_num not in page_markdowns:
+                page_markdowns[page_num] = []
+            page_markdowns[page_num].append((r["chunk"], r["markdown"]))
 
-    markdown_parts = [f"# Page {r['page'] + 1}\n\n{r['markdown']}" for r in successful]
+    total_pages = len(set(c["page"] for c in chunks))
+    successful_pages = len(page_markdowns)
+
+    markdown_parts = []
+    for page_num in sorted(page_markdowns.keys()):
+        chunks_md = [md for _, md in sorted(page_markdowns[page_num])]
+        combined_page_md = "\n\n".join(chunks_md)
+        markdown_parts.append(f"# Page {page_num + 1}\n\n{combined_page_md}")
+
     combined = "\n\n---\n\n".join(markdown_parts) if markdown_parts else "# Conversion Failed"
 
     return ConvertResponse(
         markdown=combined,
-        total_pages=len(images),
-        successful_pages=len(successful),
-        failed_pages=len(failed)
+        total_pages=total_pages,
+        successful_pages=successful_pages,
+        failed_pages=total_pages - successful_pages
     )
 
 
