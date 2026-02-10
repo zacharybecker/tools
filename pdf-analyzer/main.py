@@ -79,11 +79,9 @@ async def call_litellm(client, semaphore, image_bytes, page_num):
         )
 
         if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
-            if retry_after:
-                wait_time = int(retry_after)
-                logger.warning(f"Rate limited on page {page_num + 1}, waiting {wait_time}s")
-                await asyncio.sleep(wait_time)
+            retry_after = int(response.headers.get("Retry-After", "30"))
+            logger.warning(f"Rate limited on page {page_num + 1}, waiting {retry_after}s before retry")
+            await asyncio.sleep(retry_after)
 
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
