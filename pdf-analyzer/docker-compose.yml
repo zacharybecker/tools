@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  pdf-converter:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - LITELLM_BASE_URL=${LITELLM_BASE_URL}
+      - LITELLM_MODEL=${LITELLM_MODEL}
+      - LITELLM_API_KEY=${LITELLM_API_KEY:-}
+      - MAX_CONCURRENT_LLM_CALLS=${MAX_CONCURRENT_LLM_CALLS:-5}
+      - MAX_PDF_SIZE_MB=${MAX_PDF_SIZE_MB:-50}
+      - MAX_RETRIES=${MAX_RETRIES:-5}
+      - IMAGE_DPI=${IMAGE_DPI:-300}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5.0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s

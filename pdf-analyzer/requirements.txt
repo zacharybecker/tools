@@ -1,0 +1,18 @@
+# Web framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.6.0
+pydantic-settings==2.1.0
+
+# Async HTTP client
+httpx==0.26.0
+
+# PDF processing
+PyMuPDF==1.23.26
+Pillow==10.2.0
+
+# Retry logic
+tenacity==8.2.3
+
+# Environment variables
+python-dotenv==1.0.0
