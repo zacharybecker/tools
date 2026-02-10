@@ -17,6 +17,8 @@ LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL")
 LITELLM_MODEL = os.getenv("LITELLM_MODEL")
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "5"))
 MAX_PDF_SIZE_MB = int(os.getenv("MAX_PDF_SIZE_MB", "50"))
+DEFAULT_DPI = int(os.getenv("DEFAULT_DPI", "300"))
+MAX_DIMENSION_PX = int(os.getenv("MAX_DIMENSION_PX", "3000"))
 
 
 def should_retry(exception):
@@ -106,7 +108,21 @@ async def convert_pdf(request: ConvertRequest):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     images = []
     for page in doc:
-        pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
+        width_pt = page.rect.width
+        height_pt = page.rect.height
+
+        width_px = width_pt * DEFAULT_DPI / 72
+        height_px = height_pt * DEFAULT_DPI / 72
+        max_current = max(width_px, height_px)
+
+        if max_current > MAX_DIMENSION_PX:
+            scale = MAX_DIMENSION_PX / max_current
+            dpi = DEFAULT_DPI * scale
+        else:
+            dpi = DEFAULT_DPI
+
+        zoom = dpi / 72
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
         images.append(pix.tobytes("png"))
     doc.close()
 
