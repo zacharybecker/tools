@@ -47,6 +47,18 @@ class ConvertResponse(BaseModel):
     failed_pages: int
 
 
+class ImageChunk(BaseModel):
+    page_number: int
+    chunk_number: int
+    total_chunks: int
+    image_data: str  # base64 encoded PNG
+
+
+class ExtractImagesResponse(BaseModel):
+    images: list[ImageChunk]
+    total_pages: int
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.client = httpx.AsyncClient(timeout=120.0)
@@ -161,6 +173,57 @@ async def convert_pdf(request: ConvertRequest):
         total_pages=total_pages,
         successful_pages=successful_pages,
         failed_pages=total_pages - successful_pages
+    )
+
+
+@app.post("/extract-images", response_model=ExtractImagesResponse)
+async def extract_images(request: ConvertRequest):
+    pdf_bytes = base64.b64decode(request.pdf_data)
+
+    if len(pdf_bytes) / (1024 * 1024) > MAX_PDF_SIZE_MB:
+        raise HTTPException(400, f"PDF exceeds {MAX_PDF_SIZE_MB}MB")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    zoom = DPI / 72
+    matrix = fitz.Matrix(zoom, zoom)
+
+    image_chunks = []
+    for page_num, page in enumerate(doc):
+        width_px = page.rect.width * zoom
+        height_px = page.rect.height * zoom
+
+        if height_px <= MAX_DIMENSION_PX and width_px <= MAX_DIMENSION_PX:
+            pix = page.get_pixmap(matrix=matrix)
+            image_base64 = base64.b64encode(pix.tobytes("png")).decode()
+            image_chunks.append(ImageChunk(
+                page_number=page_num + 1,
+                chunk_number=1,
+                total_chunks=1,
+                image_data=image_base64
+            ))
+        else:
+            num_chunks = int((max(height_px, width_px) / MAX_DIMENSION_PX)) + 1
+            chunk_height_pt = page.rect.height / num_chunks
+            overlap_pt = OVERLAP_PX / zoom
+
+            for chunk_idx in range(num_chunks):
+                y0 = max(0, chunk_idx * chunk_height_pt - overlap_pt)
+                y1 = min(page.rect.height, (chunk_idx + 1) * chunk_height_pt + overlap_pt)
+                clip = fitz.Rect(0, y0, page.rect.width, y1)
+                pix = page.get_pixmap(matrix=matrix, clip=clip)
+                image_base64 = base64.b64encode(pix.tobytes("png")).decode()
+                image_chunks.append(ImageChunk(
+                    page_number=page_num + 1,
+                    chunk_number=chunk_idx + 1,
+                    total_chunks=num_chunks,
+                    image_data=image_base64
+                ))
+
+    doc.close()
+
+    return ExtractImagesResponse(
+        images=image_chunks,
+        total_pages=len(doc)
     )
 
 
