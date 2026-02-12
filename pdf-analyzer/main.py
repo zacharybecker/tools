@@ -20,6 +20,7 @@ MAX_PDF_SIZE_MB = int(os.getenv("MAX_PDF_SIZE_MB", "50"))
 DPI = 300
 MAX_DIMENSION_PX = int(os.getenv("MAX_DIMENSION_PX", "3000"))
 OVERLAP_PX = 100
+JPG_QUALITY = int(os.getenv("JPG_QUALITY", "95"))
 
 
 def should_retry(exception):
@@ -74,7 +75,7 @@ async def call_litellm(client, semaphore, image_bytes, label):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Convert this PDF page section to markdown. Preserve structure and formatting."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}}
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
                     ]
                 }],
                 "max_tokens": 4096
@@ -118,7 +119,7 @@ async def convert_pdf(request: ConvertRequest):
 
         if height_px <= MAX_DIMENSION_PX and width_px <= MAX_DIMENSION_PX:
             pix = page.get_pixmap(matrix=matrix)
-            chunks.append({"image": pix.tobytes("png"), "page": page_num, "chunk": 0, "total_chunks": 1})
+            chunks.append({"image": pix.tobytes("jpeg", jpg_quality=JPG_QUALITY), "page": page_num, "chunk": 0, "total_chunks": 1})
         else:
             num_chunks = int((max(height_px, width_px) / MAX_DIMENSION_PX)) + 1
             chunk_height_pt = page.rect.height / num_chunks
@@ -129,7 +130,7 @@ async def convert_pdf(request: ConvertRequest):
                 y1 = min(page.rect.height, (chunk_idx + 1) * chunk_height_pt + overlap_pt)
                 clip = fitz.Rect(0, y0, page.rect.width, y1)
                 pix = page.get_pixmap(matrix=matrix, clip=clip)
-                chunks.append({"image": pix.tobytes("png"), "page": page_num, "chunk": chunk_idx, "total_chunks": num_chunks})
+                chunks.append({"image": pix.tobytes("jpeg", jpg_quality=JPG_QUALITY), "page": page_num, "chunk": chunk_idx, "total_chunks": num_chunks})
 
     doc.close()
 
