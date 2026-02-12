@@ -45,10 +45,17 @@ class ConvertRequest(BaseModel):
             raise ValueError("Invalid base64")
 
 
-class ConvertPptxRequest(BaseModel):
-    pptx_data: str
+class ConvertPresentationRequest(BaseModel):
+    presentation_data: str
+    format: str = "pptx"
 
-    @validator('pptx_data')
+    @validator('format')
+    def validate_format(cls, v):
+        if v not in ("ppt", "pptx"):
+            raise ValueError("Format must be 'ppt' or 'pptx'")
+        return v
+
+    @validator('presentation_data')
     def validate_base64(cls, v):
         try:
             base64.b64decode(v, validate=True)
@@ -178,16 +185,16 @@ async def process_chunks(chunks):
     )
 
 
-def pptx_to_pdf(pptx_bytes):
+def presentation_to_pdf(file_bytes, ext):
     with tempfile.TemporaryDirectory() as tmpdir:
-        pptx_path = os.path.join(tmpdir, "input.pptx")
-        with open(pptx_path, "wb") as f:
-            f.write(pptx_bytes)
+        input_path = os.path.join(tmpdir, f"input.{ext}")
+        with open(input_path, "wb") as f:
+            f.write(file_bytes)
 
         profile_dir = os.path.join(tmpdir, "profile")
         result = subprocess.run(
             ["libreoffice", "--headless", f"-env:UserInstallation=file://{profile_dir}",
-             "--convert-to", "pdf", "--outdir", tmpdir, pptx_path],
+             "--convert-to", "pdf", "--outdir", tmpdir, input_path],
             capture_output=True, timeout=120
         )
         if result.returncode != 0:
@@ -213,14 +220,14 @@ async def convert_pdf(request: ConvertRequest):
 
 
 @app.post("/convert-pptx", response_model=ConvertResponse)
-async def convert_pptx(request: ConvertPptxRequest):
-    pptx_bytes = base64.b64decode(request.pptx_data)
+async def convert_pptx(request: ConvertPresentationRequest):
+    file_bytes = base64.b64decode(request.presentation_data)
 
-    if len(pptx_bytes) / (1024 * 1024) > MAX_FILE_SIZE_MB:
-        raise HTTPException(400, f"PPTX exceeds {MAX_FILE_SIZE_MB}MB")
+    if len(file_bytes) / (1024 * 1024) > MAX_FILE_SIZE_MB:
+        raise HTTPException(400, f"File exceeds {MAX_FILE_SIZE_MB}MB")
 
     async with libreoffice_semaphore:
-        pdf_bytes = await asyncio.to_thread(pptx_to_pdf, pptx_bytes)
+        pdf_bytes = await asyncio.to_thread(presentation_to_pdf, file_bytes, request.format)
     chunks = render_pdf_to_chunks(pdf_bytes)
     return await process_chunks(chunks)
 
