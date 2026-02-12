@@ -2,6 +2,8 @@ import os
 import base64
 import asyncio
 import logging
+import tempfile
+import subprocess
 from contextlib import asynccontextmanager
 
 import fitz
@@ -16,7 +18,9 @@ logger = logging.getLogger(__name__)
 LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL")
 LITELLM_MODEL = os.getenv("LITELLM_MODEL")
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "5"))
-MAX_PDF_SIZE_MB = int(os.getenv("MAX_PDF_SIZE_MB", "50"))
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
+MAX_CONCURRENT_CONVERSIONS = int(os.getenv("MAX_CONCURRENT_CONVERSIONS", "2"))
+libreoffice_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONVERSIONS)
 DPI = 300
 MAX_DIMENSION_PX = int(os.getenv("MAX_DIMENSION_PX", "3000"))
 OVERLAP_PX = 100
@@ -33,6 +37,18 @@ class ConvertRequest(BaseModel):
     pdf_data: str
 
     @validator('pdf_data')
+    def validate_base64(cls, v):
+        try:
+            base64.b64decode(v, validate=True)
+            return v
+        except:
+            raise ValueError("Invalid base64")
+
+
+class ConvertPptxRequest(BaseModel):
+    pptx_data: str
+
+    @validator('pptx_data')
     def validate_base64(cls, v):
         try:
             base64.b64decode(v, validate=True)
@@ -101,13 +117,7 @@ async def convert_chunk(client, semaphore, image_bytes, page_num, chunk_num, tot
         return {"success": False, "page": page_num, "chunk": chunk_num, "error": str(e)}
 
 
-@app.post("/convert", response_model=ConvertResponse)
-async def convert_pdf(request: ConvertRequest):
-    pdf_bytes = base64.b64decode(request.pdf_data)
-
-    if len(pdf_bytes) / (1024 * 1024) > MAX_PDF_SIZE_MB:
-        raise HTTPException(400, f"PDF exceeds {MAX_PDF_SIZE_MB}MB")
-
+def render_pdf_to_chunks(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     zoom = DPI / 72
     matrix = fitz.Matrix(zoom, zoom)
@@ -133,7 +143,10 @@ async def convert_pdf(request: ConvertRequest):
                 chunks.append({"image": pix.tobytes("jpeg", jpg_quality=JPG_QUALITY), "page": page_num, "chunk": chunk_idx, "total_chunks": num_chunks})
 
     doc.close()
+    return chunks
 
+
+async def process_chunks(chunks):
     tasks = [convert_chunk(app.state.client, app.state.semaphore, c["image"], c["page"], c["chunk"], c["total_chunks"])
              for c in chunks]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -163,6 +176,53 @@ async def convert_pdf(request: ConvertRequest):
         successful_pages=successful_pages,
         failed_pages=total_pages - successful_pages
     )
+
+
+def pptx_to_pdf(pptx_bytes):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pptx_path = os.path.join(tmpdir, "input.pptx")
+        with open(pptx_path, "wb") as f:
+            f.write(pptx_bytes)
+
+        profile_dir = os.path.join(tmpdir, "profile")
+        result = subprocess.run(
+            ["libreoffice", "--headless", f"-env:UserInstallation=file://{profile_dir}",
+             "--convert-to", "pdf", "--outdir", tmpdir, pptx_path],
+            capture_output=True, timeout=120
+        )
+        if result.returncode != 0:
+            raise HTTPException(500, f"LibreOffice conversion failed: {result.stderr.decode()}")
+
+        pdf_path = os.path.join(tmpdir, "input.pdf")
+        if not os.path.exists(pdf_path):
+            raise HTTPException(500, "LibreOffice produced no PDF output")
+
+        with open(pdf_path, "rb") as f:
+            return f.read()
+
+
+@app.post("/convert", response_model=ConvertResponse)
+async def convert_pdf(request: ConvertRequest):
+    pdf_bytes = base64.b64decode(request.pdf_data)
+
+    if len(pdf_bytes) / (1024 * 1024) > MAX_FILE_SIZE_MB:
+        raise HTTPException(400, f"PDF exceeds {MAX_FILE_SIZE_MB}MB")
+
+    chunks = render_pdf_to_chunks(pdf_bytes)
+    return await process_chunks(chunks)
+
+
+@app.post("/convert-pptx", response_model=ConvertResponse)
+async def convert_pptx(request: ConvertPptxRequest):
+    pptx_bytes = base64.b64decode(request.pptx_data)
+
+    if len(pptx_bytes) / (1024 * 1024) > MAX_FILE_SIZE_MB:
+        raise HTTPException(400, f"PPTX exceeds {MAX_FILE_SIZE_MB}MB")
+
+    async with libreoffice_semaphore:
+        pdf_bytes = await asyncio.to_thread(pptx_to_pdf, pptx_bytes)
+    chunks = render_pdf_to_chunks(pdf_bytes)
+    return await process_chunks(chunks)
 
 
 @app.get("/health")
