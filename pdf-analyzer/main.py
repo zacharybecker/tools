@@ -205,7 +205,12 @@ def presentation_to_pdf(file_bytes, ext):
             raise HTTPException(500, "LibreOffice produced no PDF output")
 
         with open(pdf_path, "rb") as f:
-            return f.read()
+            raw_pdf = f.read()
+
+        doc = fitz.open(stream=raw_pdf, filetype="pdf")
+        clean_pdf = doc.tobytes(garbage=4, clean=True)
+        doc.close()
+        return clean_pdf
 
 
 @app.post("/convert", response_model=ConvertResponse)
