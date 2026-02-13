@@ -2,9 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends libreoffice-impress && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir fastapi uvicorn httpx PyMuPDF tenacity
+RUN pip install --no-cache-dir fastapi uvicorn httpx PyMuPDF tenacity python-pptx Pillow
 
 COPY main.py .
 
