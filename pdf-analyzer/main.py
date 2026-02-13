@@ -2,6 +2,9 @@ import os
 import base64
 import asyncio
 import logging
+import tempfile
+import subprocess
+import uuid
 from io import BytesIO
 from contextlib import asynccontextmanager
 
@@ -51,10 +54,8 @@ class ConvertPresentationRequest(BaseModel):
 
     @validator('format')
     def validate_format(cls, v):
-        if v == "ppt":
-            raise ValueError("PPT format is no longer supported. Please convert to PPTX first.")
-        if v != "pptx":
-            raise ValueError("Format must be 'pptx'")
+        if v not in ("ppt", "pptx"):
+            raise ValueError("Format must be 'ppt' or 'pptx'")
         return v
 
     @validator('presentation_data')
@@ -71,6 +72,11 @@ class ConvertResponse(BaseModel):
     total_pages: int
     successful_pages: int
     failed_pages: int
+
+
+class ConvertPresentationToPdfResponse(BaseModel):
+    pdf_data: str
+    pages: int
 
 
 @asynccontextmanager
@@ -391,6 +397,86 @@ def resolve_image_placeholders(md, descriptions):
     return md
 
 
+_NS_A = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
+_NS_P = '{http://schemas.openxmlformats.org/presentationml/2006/main}'
+_SHAPE_TAG_SUFFIXES = ('}sp', '}pic', '}grpSp')
+
+
+def _remove_decorative_shapes(sp_tree):
+    """Remove shapes from an spTree that have no text, images, or placeholder role."""
+    for sp in list(sp_tree):
+        if not any(sp.tag.endswith(s) for s in _SHAPE_TAG_SUFFIXES):
+            continue
+        has_text = sp.findall(f'.//{_NS_A}t')
+        has_image = sp.findall(f'.//{_NS_A}blip') or sp.tag.endswith('}pic')
+        is_placeholder = sp.findall(f'.//{_NS_P}ph')
+        if not has_text and not has_image and not is_placeholder:
+            sp_tree.remove(sp)
+
+
+def strip_presentation_backgrounds(file_bytes):
+    """Remove backgrounds and decorative shapes from a PPTX presentation."""
+    prs = Presentation(BytesIO(file_bytes))
+
+    for slide in prs.slides:
+        slide.background.fill.background()
+
+    for layout in prs.slide_layouts:
+        layout.background.fill.background()
+        _remove_decorative_shapes(layout.shapes._spTree)
+
+    for master in prs.slide_masters:
+        master.background.fill.background()
+        _remove_decorative_shapes(master.shapes._spTree)
+
+    buf = BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def _libreoffice_convert(file_bytes, input_ext, output_fmt):
+    """Run LibreOffice headless to convert a file. Returns output file bytes."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input.{input_ext}")
+        with open(input_path, "wb") as f:
+            f.write(file_bytes)
+
+        profile_dir = os.path.join(tmpdir, f"profile-{uuid.uuid4().hex}")
+        result = subprocess.run(
+            [
+                "libreoffice", "--headless", "--norestore",
+                f"-env:UserInstallation=file://{profile_dir}",
+                "--convert-to", output_fmt,
+                "--outdir", tmpdir,
+                input_path,
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            logger.error(f"LibreOffice conversion failed: {result.stderr.decode()}")
+            raise RuntimeError(f"LibreOffice conversion failed: {result.stderr.decode()}")
+
+        output_path = os.path.join(tmpdir, f"input.{output_fmt}")
+        if not os.path.exists(output_path):
+            raise RuntimeError(f"LibreOffice did not produce a .{output_fmt} output file")
+
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
+def presentation_to_pdf(file_bytes, fmt):
+    """Convert a presentation (PPT or PPTX) to PDF bytes using LibreOffice."""
+    if fmt == "pptx":
+        file_bytes = strip_presentation_backgrounds(file_bytes)
+    return _libreoffice_convert(file_bytes, fmt, "pdf")
+
+
+def convert_ppt_to_pptx(file_bytes):
+    """Convert PPT bytes to PPTX bytes using LibreOffice."""
+    return _libreoffice_convert(file_bytes, "ppt", "pptx")
+
+
 async def extract_pptx_to_markdown(file_bytes):
     prs = Presentation(BytesIO(file_bytes))
     total_slides = len(prs.slides)
@@ -440,7 +526,35 @@ async def convert_pptx(request: ConvertPresentationRequest):
     if len(file_bytes) / (1024 * 1024) > MAX_FILE_SIZE_MB:
         raise HTTPException(400, f"File exceeds {MAX_FILE_SIZE_MB}MB")
 
+    if request.format == "ppt":
+        try:
+            file_bytes = convert_ppt_to_pptx(file_bytes)
+        except Exception as e:
+            raise HTTPException(500, f"Failed to convert PPT to PPTX: {e}")
+
     return await extract_pptx_to_markdown(file_bytes)
+
+
+@app.post("/convert-presentation-to-pdf", response_model=ConvertPresentationToPdfResponse)
+async def convert_presentation_to_pdf(request: ConvertPresentationRequest):
+    file_bytes = base64.b64decode(request.presentation_data)
+
+    if len(file_bytes) / (1024 * 1024) > MAX_FILE_SIZE_MB:
+        raise HTTPException(400, f"File exceeds {MAX_FILE_SIZE_MB}MB")
+
+    try:
+        pdf_bytes = presentation_to_pdf(file_bytes, request.format)
+    except Exception as e:
+        raise HTTPException(500, f"Presentation to PDF conversion failed: {e}")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_count = len(doc)
+    doc.close()
+
+    return ConvertPresentationToPdfResponse(
+        pdf_data=base64.b64encode(pdf_bytes).decode(),
+        pages=page_count,
+    )
 
 
 @app.get("/health")
